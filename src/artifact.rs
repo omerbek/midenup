@@ -1,5 +1,4 @@
 use std::{
-    borrow::Cow,
     collections::BTreeMap,
     fmt,
     path::{Path, PathBuf},
@@ -44,6 +43,153 @@ pub enum InvalidArtifactError {
         component: String,
         target: String,
     },
+    #[error(
+        "invalid artifact: artifact {id} of {component} is packaged as '{format}', which this \
+         version of midenup cannot read"
+    )]
+    UnsupportedArchiveFormat {
+        id: String,
+        component: String,
+        format: String,
+    },
+}
+
+/// How an artifact is packaged at its URI.
+///
+/// The archive must hold exactly one file, which is the artifact -- midenup installs that file.
+/// An archive holding several is an error.
+///
+/// A format this build has never heard of parses and round-trips, and is rejected only when an
+/// installation is planned for it. Refusing to parse would break every command for every user, over
+/// a channel they may not even be installing (spec section 4.4).
+#[derive(Debug, Clone, Hash, PartialEq)]
+pub struct Archive {
+    pub format: ArchiveFormat,
+    /// Fields declared by a newer schema that this build does not recognize.
+    pub extra: crate::manifest::v3::unknown::Extra,
+}
+
+/// The typed shape of an archive, without the unknown-field capture.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "kebab-case")]
+struct ArchiveFields {
+    format: ArchiveFormat,
+}
+
+/// Serialized as a bare format string when that is all it is, which is every archive this build
+/// declares itself.
+impl Serialize for Archive {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::Error;
+
+        if self.extra.is_empty() {
+            return self.format.serialize(serializer);
+        }
+        crate::manifest::v3::unknown::merge_extra(
+            &ArchiveFields { format: self.format.clone() },
+            &self.extra,
+        )
+        .map_err(S::Error::custom)?
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Archive {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+
+        let value = serde_json::Value::deserialize(deserializer)?;
+
+        // The shape every archive needs today; the object form exists so a newer schema can add
+        // fields beside the format without this build losing them.
+        if let serde_json::Value::String(format) = value {
+            return Ok(Self {
+                format: ArchiveFormat::parse(&format),
+                extra: Default::default(),
+            });
+        }
+
+        let (fields, extra) = crate::manifest::v3::unknown::split_extra::<ArchiveFields>(value)
+            .map_err(D::Error::custom)?;
+        Ok(Self { format: fields.format, extra })
+    }
+}
+
+/// The format an artifact is packaged in.
+///
+/// Adding a format is a variant here, an arm in [ArchiveFormat::parse] and [ArchiveFormat::as_str],
+/// and a reader in [crate::install::archive]. The round-trip test pins those in step.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub enum ArchiveFormat {
+    /// A gzip-compressed tar archive.
+    TarGz,
+    /// A format this build cannot read. Recorded verbatim so it round-trips; rejected before an
+    /// installation is planned for it.
+    Unsupported(String),
+}
+
+impl ArchiveFormat {
+    /// Interprets a declared spelling. An unrecognized one is a value, not a failure: see
+    /// [Archive].
+    pub fn parse(spelling: &str) -> Self {
+        match spelling {
+            "tar.gz" => Self::TarGz,
+            other => Self::Unsupported(other.to_string()),
+        }
+    }
+
+    pub fn is_supported(&self) -> bool {
+        !matches!(self, Self::Unsupported(_))
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::TarGz => "tar.gz",
+            Self::Unsupported(spelling) => spelling,
+        }
+    }
+
+    /// Every spelling an author may write.
+    pub fn supported_spellings() -> impl Iterator<Item = &'static str> {
+        ["tar.gz"].into_iter()
+    }
+}
+
+impl core::str::FromStr for ArchiveFormat {
+    type Err = core::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self::parse(s))
+    }
+}
+
+impl fmt::Display for ArchiveFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for ArchiveFormat {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ArchiveFormat {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self::parse(&String::deserialize(deserializer)?))
+    }
+}
+
+/// An artifact resolved for one target: where to fetch it, and what it is packaged as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedArtifact {
+    pub uri: ArtifactUri,
+    /// Present when the fetched bytes are an archive rather than the file itself.
+    ///
+    /// Only a readable format gets this far -- resolution rejects the rest -- so the executor
+    /// never has to decide what to do with a container it does not understand.
+    pub archive: Option<ArchiveFormat>,
 }
 
 /// All the artifacts that the [Component] contains.
@@ -62,7 +208,7 @@ impl Artifacts {
         self.artifacts.insert(id, artifact).is_none()
     }
 
-    /// Returns the `(artifact id, uri)` pairs that should be installed for `target`.
+    /// Returns the `(artifact id, resolved artifact)` pairs that should be installed for `target`.
     ///
     /// The artifact id is the exact filename the artifact is installed as, so callers must use it
     /// to compute a destination path rather than inferring one from the URI.
@@ -70,13 +216,13 @@ impl Artifacts {
         &'a self,
         target: &str,
         component: &'a Component,
-    ) -> Result<Vec<(&'a str, ArtifactUri)>, InvalidArtifactError> {
+    ) -> Result<Vec<(&'a str, ResolvedArtifact)>, InvalidArtifactError> {
         match component.kind() {
             ComponentKind::Asset => self.get_artifacts_for_target(target, component),
             ComponentKind::CargoExtension { spec, .. } | ComponentKind::Executable { spec, .. } => {
                 let id = spec.installed_executable.as_str();
                 let artifact = self.get_artifact_for_target(id, target, component)?;
-                Ok(artifact.into_iter().map(|uri| (id, uri)).collect())
+                Ok(artifact.into_iter().map(|resolved| (id, resolved)).collect())
             },
             // Never selected for installation, so it has no artifacts to resolve. The resolver
             // is the gate that rejects it; this arm just keeps the match total.
@@ -87,16 +233,16 @@ impl Artifacts {
         }
     }
 
-    /// Returns every declared `(artifact id, uri)` pair available for `target`.
+    /// Returns every declared `(artifact id, resolved artifact)` pair available for `target`.
     pub fn get_artifacts_for_target(
         &self,
         target: &str,
         component: &Component,
-    ) -> Result<Vec<(&str, ArtifactUri)>, InvalidArtifactError> {
+    ) -> Result<Vec<(&str, ResolvedArtifact)>, InvalidArtifactError> {
         let mut artifacts = Vec::with_capacity(self.artifacts.len());
         for (id, artifact) in self.artifacts.iter() {
-            if let Some(uri) = artifact.get_uri_for(id, target, component)? {
-                artifacts.push((id.as_str(), uri));
+            if let Some(resolved) = artifact.resolve_for(id, target, component)? {
+                artifacts.push((id.as_str(), resolved));
             }
         }
 
@@ -108,11 +254,11 @@ impl Artifacts {
         id: &str,
         target: &str,
         component: &Component,
-    ) -> Result<Option<ArtifactUri>, InvalidArtifactError> {
+    ) -> Result<Option<ResolvedArtifact>, InvalidArtifactError> {
         let Some(artifact) = self.artifacts.get(id) else {
             return Ok(None);
         };
-        artifact.get_uri_for(id, target, component)
+        artifact.resolve_for(id, target, component)
     }
 }
 
@@ -167,6 +313,8 @@ pub enum Artifact {
         targets: BTreeMap<String, Substitutions>,
         /// An optional content digest. Recorded and round-tripped, never verified. See [Digest].
         digest: Option<Digest>,
+        /// How the artifact is packaged at that URI, if it is not the bare file. See [Archive].
+        archive: Option<Archive>,
         /// Fields declared by a newer schema that this build does not recognize.
         extra: crate::manifest::v3::unknown::Extra,
     },
@@ -180,6 +328,8 @@ pub enum Artifact {
         uri: String,
         /// An optional content digest. Recorded and round-tripped, never verified. See [Digest].
         digest: Option<Digest>,
+        /// How the artifact is packaged at that URI, if it is not the bare file. See [Archive].
+        archive: Option<Archive>,
         /// Fields declared by a newer schema that this build does not recognize.
         extra: crate::manifest::v3::unknown::Extra,
     },
@@ -199,27 +349,39 @@ enum ArtifactFields {
         targets: BTreeMap<String, Substitutions>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         digest: Option<Digest>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        archive: Option<Archive>,
     },
     TargetAgnostic {
         uri: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         digest: Option<Digest>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        archive: Option<Archive>,
     },
 }
 
 impl Artifact {
     fn fields(&self) -> ArtifactFields {
         match self {
-            Self::TargetSpecific { uri, substitutions, targets, digest, .. } => {
-                ArtifactFields::TargetSpecific {
-                    uri: uri.clone(),
-                    substitutions: substitutions.clone(),
-                    targets: targets.clone(),
-                    digest: digest.clone(),
-                }
+            Self::TargetSpecific {
+                uri,
+                substitutions,
+                targets,
+                digest,
+                archive,
+                ..
+            } => ArtifactFields::TargetSpecific {
+                uri: uri.clone(),
+                substitutions: substitutions.clone(),
+                targets: targets.clone(),
+                digest: digest.clone(),
+                archive: archive.clone(),
             },
-            Self::TargetAgnostic { uri, digest, .. } => {
-                ArtifactFields::TargetAgnostic { uri: uri.clone(), digest: digest.clone() }
+            Self::TargetAgnostic { uri, digest, archive, .. } => ArtifactFields::TargetAgnostic {
+                uri: uri.clone(),
+                digest: digest.clone(),
+                archive: archive.clone(),
             },
         }
     }
@@ -260,17 +422,22 @@ impl<'de> Deserialize<'de> for Artifact {
             .map_err(D::Error::custom)?;
 
         Ok(match fields {
-            ArtifactFields::TargetSpecific { uri, substitutions, targets, digest } => {
-                Self::TargetSpecific {
-                    uri,
-                    substitutions,
-                    targets,
-                    digest,
-                    extra,
-                }
+            ArtifactFields::TargetSpecific {
+                uri,
+                substitutions,
+                targets,
+                digest,
+                archive,
+            } => Self::TargetSpecific {
+                uri,
+                substitutions,
+                targets,
+                digest,
+                archive,
+                extra,
             },
-            ArtifactFields::TargetAgnostic { uri, digest } => {
-                Self::TargetAgnostic { uri, digest, extra }
+            ArtifactFields::TargetAgnostic { uri, digest, archive } => {
+                Self::TargetAgnostic { uri, digest, archive, extra }
             },
         })
     }
@@ -278,10 +445,22 @@ impl<'de> Deserialize<'de> for Artifact {
 
 impl Artifact {
     /// The declared content digest, if any. Never verified -- see [Digest].
+    ///
+    /// For an archived artifact it describes the archive as fetched, not the file installed out of
+    /// it.
     pub fn digest(&self) -> Option<&Digest> {
         match self {
             Self::TargetSpecific { digest, .. } | Self::TargetAgnostic { digest, .. } => {
                 digest.as_ref()
+            },
+        }
+    }
+
+    /// How the artifact is packaged at its URI, if it is not the bare file.
+    pub fn archive(&self) -> Option<&Archive> {
+        match self {
+            Self::TargetSpecific { archive, .. } | Self::TargetAgnostic { archive, .. } => {
+                archive.as_ref()
             },
         }
     }
@@ -343,14 +522,14 @@ impl Artifact {
         let mut artifacts = vec![];
         match self {
             Self::TargetAgnostic { .. } => {
-                if let Some(artifact) = self.get_uri_for(id, "", component)? {
-                    artifacts.push(artifact);
+                if let Some(artifact) = self.resolve_for(id, "", component)? {
+                    artifacts.push(artifact.uri);
                 }
             },
             Self::TargetSpecific { targets, .. } => {
                 for target in targets.keys() {
-                    if let Some(artifact) = self.get_uri_for(id, target, component)? {
-                        artifacts.push(artifact);
+                    if let Some(artifact) = self.resolve_for(id, target, component)? {
+                        artifacts.push(artifact.uri);
                     }
                 }
             },
@@ -359,62 +538,63 @@ impl Artifact {
         Ok(artifacts)
     }
 
-    /// Returns the URI for the specified target, with the provided component details for use in
-    /// substitution patterns:
-    pub fn get_uri_for(
+    /// Resolves the artifact for `target`: its URI, and what it is packaged as.
+    pub fn resolve_for(
         &self,
         id: &str,
         target: &str,
         component: &Component,
-    ) -> Result<Option<ArtifactUri>, InvalidArtifactError> {
+    ) -> Result<Option<ResolvedArtifact>, InvalidArtifactError> {
         match self {
-            Self::TargetAgnostic { uri, .. } => {
+            Self::TargetAgnostic { uri, archive, .. } => {
+                let subs = Substituter {
+                    id,
+                    component,
+                    // Nothing but `%version` is available to a target-agnostic artifact.
+                    target: None,
+                    basename: None,
+                    extension: None,
+                };
                 let Some((scheme, rest)) = uri.split_once("://") else {
                     return Err(InvalidArtifactError::MissingScheme {
                         id: id.to_string(),
                         component: component.name.to_string(),
                     });
                 };
-                let rest = if rest.contains("%version") {
-                    let Authority::Registry { version } = &component.version else {
-                        return Err(InvalidArtifactError::VersionUnavailable {
-                            id: id.to_string(),
-                            component: component.name.to_string(),
-                        });
-                    };
-                    Cow::Owned(rest.replace("%version", &version.to_string()))
-                } else {
-                    Cow::Borrowed(rest)
-                };
-                match scheme {
-                    "file" => Ok(Some(ArtifactUri::File(PathBuf::from(rest.into_owned())))),
-                    "http" | "https" => Ok(Some(ArtifactUri::Http(format!("{scheme}://{rest}")))),
-                    scheme => Err(InvalidArtifactError::InvalidScheme {
-                        id: id.to_string(),
-                        component: component.name.to_string(),
-                        scheme: scheme.to_string(),
-                    }),
-                }
+                let rest = subs.apply(rest)?;
+                Ok(Some(ResolvedArtifact {
+                    uri: subs.uri(scheme, &rest)?,
+                    archive: subs.archive(archive.as_ref())?,
+                }))
             },
-            Self::TargetSpecific { uri, substitutions, targets, .. } => {
+            Self::TargetSpecific { uri, substitutions, targets, archive, .. } => {
                 let Some(target_subs) = targets.get(target) else {
                     return Ok(None);
                 };
-                let basename = target_subs
-                    .basename
-                    .as_deref()
-                    .or(substitutions.as_ref().and_then(|subs| subs.basename.as_deref()))
-                    .unwrap_or(component.name.as_ref());
-                let extension = target_subs
-                    .extension
-                    .as_deref()
-                    .or(substitutions.as_ref().and_then(|subs| subs.extension.as_deref()));
+                let subs = Substituter {
+                    id,
+                    component,
+                    target: Some(target),
+                    basename: Some(
+                        target_subs
+                            .basename
+                            .as_deref()
+                            .or(substitutions.as_ref().and_then(|subs| subs.basename.as_deref()))
+                            .unwrap_or(component.name.as_ref()),
+                    ),
+                    extension: target_subs
+                        .extension
+                        .as_deref()
+                        .or(substitutions.as_ref().and_then(|subs| subs.extension.as_deref())),
+                };
                 let Some((scheme, rest)) = uri.split_once("://") else {
                     return Err(InvalidArtifactError::MissingScheme {
                         id: id.to_string(),
                         component: component.name.to_string(),
                     });
                 };
+                // A URI that does not vary by target would resolve to the same file for every
+                // target it declares, which is not a target-specific artifact at all.
                 if !rest.contains("%target") {
                     return Err(InvalidArtifactError::MissingTarget {
                         id: id.to_string(),
@@ -422,41 +602,100 @@ impl Artifact {
                         target: target.to_string(),
                     });
                 }
-                let rest = rest.replace("%target", target);
-                let rest = if rest.contains("%version") {
-                    let Authority::Registry { version } = &component.version else {
-                        return Err(InvalidArtifactError::VersionUnavailable {
-                            id: id.to_string(),
-                            component: component.name.to_string(),
-                        });
-                    };
-                    rest.replace("%version", &version.to_string())
-                } else {
-                    rest
-                };
-                let rest = if rest.contains("%extension") {
-                    let extension =
-                        extension.ok_or_else(|| InvalidArtifactError::UndefinedSubstitution {
-                            id: id.to_string(),
-                            component: component.name.to_string(),
-                            substitution: "%extension",
-                        })?;
-                    rest.replace("%extension", extension)
-                } else {
-                    rest
-                };
-                let rest = rest.replace("%basename", basename);
-                match scheme {
-                    "file" => Ok(Some(ArtifactUri::File(PathBuf::from(rest)))),
-                    "http" | "https" => Ok(Some(ArtifactUri::Http(format!("{scheme}://{rest}")))),
-                    scheme => Err(InvalidArtifactError::InvalidScheme {
-                        id: id.to_string(),
-                        component: component.name.to_string(),
-                        scheme: scheme.to_string(),
-                    }),
-                }
+                let rest = subs.apply(rest)?;
+                Ok(Some(ResolvedArtifact {
+                    uri: subs.uri(scheme, &rest)?,
+                    archive: subs.archive(archive.as_ref())?,
+                }))
             },
         }
+    }
+}
+
+/// The substitution values available to one artifact resolved for one target.
+///
+/// Built by both arms of [Artifact::resolve_for], so a target-specific and a target-agnostic
+/// artifact cannot interpret the same substitution differently.
+struct Substituter<'a> {
+    id: &'a str,
+    component: &'a Component,
+    /// `None` for a target-agnostic artifact, which has no target to substitute.
+    target: Option<&'a str>,
+    basename: Option<&'a str>,
+    extension: Option<&'a str>,
+}
+
+impl Substituter<'_> {
+    /// Replaces every substitution defined for this artifact in `template`.
+    ///
+    /// `%version` and `%extension` must resolve or fail: leaving the literal text in place turns a
+    /// manifest mistake into a 404 at install time. A `%basename` or `%target` with no value here
+    /// is left verbatim, since a target-agnostic URI is allowed to contain either.
+    fn apply(&self, template: &str) -> Result<String, InvalidArtifactError> {
+        let mut out = match self.target {
+            Some(target) => template.replace("%target", target),
+            None => template.to_string(),
+        };
+
+        if out.contains("%version") {
+            let Authority::Registry { version } = &self.component.version else {
+                return Err(InvalidArtifactError::VersionUnavailable {
+                    id: self.id.to_string(),
+                    component: self.component.name.to_string(),
+                });
+            };
+            out = out.replace("%version", &version.to_string());
+        }
+
+        if out.contains("%extension") {
+            let extension =
+                self.extension.ok_or_else(|| InvalidArtifactError::UndefinedSubstitution {
+                    id: self.id.to_string(),
+                    component: self.component.name.to_string(),
+                    substitution: "%extension",
+                })?;
+            out = out.replace("%extension", extension);
+        }
+
+        if let Some(basename) = self.basename {
+            out = out.replace("%basename", basename);
+        }
+
+        Ok(out)
+    }
+
+    /// Reassembles a substituted URI body into a typed URI.
+    fn uri(&self, scheme: &str, rest: &str) -> Result<ArtifactUri, InvalidArtifactError> {
+        match scheme {
+            "file" => Ok(ArtifactUri::File(PathBuf::from(rest))),
+            "http" | "https" => Ok(ArtifactUri::Http(format!("{scheme}://{rest}"))),
+            scheme => Err(InvalidArtifactError::InvalidScheme {
+                id: self.id.to_string(),
+                component: self.component.name.to_string(),
+                scheme: scheme.to_string(),
+            }),
+        }
+    }
+
+    /// Checks the declared format, rejecting one this build cannot read.
+    ///
+    /// Rejected here rather than at execution, because it is a fact about the manifest -- known
+    /// before a single byte is fetched.
+    fn archive(
+        &self,
+        archive: Option<&Archive>,
+    ) -> Result<Option<ArchiveFormat>, InvalidArtifactError> {
+        let Some(archive) = archive else {
+            return Ok(None);
+        };
+        if !archive.format.is_supported() {
+            return Err(InvalidArtifactError::UnsupportedArchiveFormat {
+                id: self.id.to_string(),
+                component: self.component.name.to_string(),
+                format: archive.format.to_string(),
+            });
+        }
+        Ok(Some(archive.format.clone()))
     }
 }
 
@@ -591,6 +830,112 @@ mod digest_tests {
 }
 
 #[cfg(test)]
+mod archive_tests {
+    use std::borrow::Cow;
+
+    use super::*;
+    use crate::{
+        manifest::{ComponentKind, ExecutableComponent, InstallationMethod},
+        profile::Profile,
+    };
+
+    const TARGET: &str = "aarch64-apple-darwin";
+
+    fn component() -> Component {
+        Component {
+            name: Cow::Borrowed("vm"),
+            version: Authority::Registry { version: semver::Version::new(0, 16, 0) },
+            kind: ComponentKind::Executable {
+                installation_method: InstallationMethod::Prebuilt,
+                spec: ExecutableComponent {
+                    installed_executable: "miden-vm".to_string(),
+                    ..Default::default()
+                },
+            },
+            profiles: vec![Profile::Minimal],
+            requires: vec![],
+            artifacts: Artifacts::default(),
+            extra: Default::default(),
+        }
+    }
+
+    fn parse(source: serde_json::Value) -> Artifact {
+        serde_json::from_value(source).expect("must parse")
+    }
+
+    /// Every supported spelling must parse to a readable format and serialize back to itself, which
+    /// is what keeps `parse` and `as_str` from drifting apart.
+    #[test]
+    fn every_supported_format_round_trips() {
+        for spelling in ArchiveFormat::supported_spellings() {
+            let source = serde_json::json!({
+                "uri": "https://example.invalid/vm.tar.gz",
+                "archive": spelling
+            });
+            let artifact = parse(source.clone());
+            let format = &artifact.archive().unwrap().format;
+            assert!(format.is_supported(), "{spelling} must be readable");
+            assert_eq!(format.as_str(), spelling);
+            assert_eq!(serde_json::to_value(&artifact).unwrap(), source);
+        }
+    }
+
+    #[test]
+    fn an_archived_artifact_resolves_to_its_format() {
+        let artifact = parse(serde_json::json!({
+            "uri": "https://example.invalid/v%version/%basename-%target.%extension",
+            "archive": "tar.gz",
+            "basename": "miden-vm",
+            "extension": "tar.gz",
+            "targets": {TARGET: {}}
+        }));
+
+        let resolved = artifact
+            .resolve_for("miden-vm", TARGET, &component())
+            .expect("must resolve")
+            .expect("the target is declared");
+
+        assert_eq!(
+            resolved.uri.to_string(),
+            format!("https://example.invalid/v0.16.0/miden-vm-{TARGET}.tar.gz")
+        );
+        assert_eq!(resolved.archive, Some(ArchiveFormat::TarGz));
+    }
+
+    /// An unreadable container is rejected when the installation is planned, not when the manifest
+    /// is parsed -- an unrelated channel must stay parseable.
+    #[test]
+    fn an_unreadable_format_parses_but_does_not_resolve() {
+        let source = serde_json::json!({
+            "uri": "https://example.invalid/vm.zip",
+            "archive": "zip"
+        });
+        let artifact = parse(source.clone());
+        assert_eq!(
+            serde_json::to_value(&artifact).unwrap(),
+            source,
+            "an unknown format must round-trip verbatim"
+        );
+
+        let err = artifact.resolve_for("miden-vm", "", &component()).expect_err("must fail");
+        assert!(matches!(err, InvalidArtifactError::UnsupportedArchiveFormat { .. }), "{err}");
+        assert!(err.to_string().contains("zip"), "the message must name the format: {err}");
+    }
+
+    /// An unarchived artifact emits no `archive` key at all, so existing manifests are untouched.
+    #[test]
+    fn an_unarchived_artifact_has_no_archive() {
+        let source = serde_json::json!({"uri": "https://example.invalid/core.masp"});
+        let artifact = parse(source.clone());
+        assert!(artifact.archive().is_none());
+        assert_eq!(serde_json::to_value(&artifact).unwrap(), source);
+
+        let resolved = artifact.resolve_for("core.masp", "", &component()).unwrap().unwrap();
+        assert!(resolved.archive.is_none());
+    }
+}
+
+#[cfg(test)]
 mod forward_compatibility_tests {
     use super::*;
 
@@ -625,6 +970,7 @@ mod forward_compatibility_tests {
             "uri": "https://example.invalid/%target.%extension",
             "basename": "miden-vm",
             "extension": "tar.gz",
+            "archive": "tar.gz",
             "targets": {"aarch64-apple-darwin": {}}
         });
 
@@ -634,10 +980,23 @@ mod forward_compatibility_tests {
         assert_eq!(out, source);
         assert_eq!(
             out.as_object().unwrap().len(),
-            4,
+            5,
             "no key may appear twice: {}",
             serde_json::to_string(&out).unwrap()
         );
+    }
+
+    /// The artifact's own capture only sees the top level, so a nested archive has to preserve its
+    /// unknown fields itself.
+    #[test]
+    fn unknown_fields_inside_an_archive_round_trip() {
+        let source = serde_json::json!({
+            "uri": "https://example.invalid/vm.tar.gz",
+            "archive": {"format": "tar.gz", "strip-components": 1}
+        });
+
+        let artifact: Artifact = serde_json::from_value(source.clone()).expect("must parse");
+        assert_eq!(serde_json::to_value(&artifact).unwrap(), source);
     }
 
     /// A malformed artifact names what is wrong with it, rather than reporting that no variant
